@@ -1,0 +1,134 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      retries: 10
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-payments}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      retries: 10
+  api:
+    build: .
+    command: sh -c "alembic upgrade head && uvicorn payment_service.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${DB_USER:-payments}
+      DB_PASSWORD: ${DB_PASSWORD:-payments}
+      DB_NAME: ${DB_NAME:-payments}
+      API_KEYS: ${API_KEYS:-changeme}
+      DOCS_ENABLED: ${DOCS_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 5s
+      retries: 10
+      start_period: 15s
+    restart: on-failure
+  relay:
+    build: .
+    command: python -m payment_service.relay
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${DB_USER:-payments}
+      DB_PASSWORD: ${DB_PASSWORD:-payments}
+      DB_NAME: ${DB_NAME:-payments}
+      RABBIT_URL: amqp://${RABBITMQ_DEFAULT_USER:-payments}:${RABBITMQ_DEFAULT_PASS:-payments}@rabbitmq:5672/
+      API_KEYS: ${API_KEYS:-changeme}
+      RETRY_TTLS_MS: ${RETRY_TTLS_MS:-5000,10000,20000}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: on-failure
+  consumer:
+    build: .
+    command: python -m payment_service.consumer
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${DB_USER:-payments}
+      DB_PASSWORD: ${DB_PASSWORD:-payments}
+      DB_NAME: ${DB_NAME:-payments}
+      RABBIT_URL: amqp://${RABBITMQ_DEFAULT_USER:-payments}:${RABBITMQ_DEFAULT_PASS:-payments}@rabbitmq:5672/
+      API_KEYS: ${API_KEYS:-changeme}
+      GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+      GATEWAY_DELAY_MIN_S: ${GATEWAY_DELAY_MIN_S:-2.0}
+      GATEWAY_DELAY_MAX_S: ${GATEWAY_DELAY_MAX_S:-5.0}
+      RETRY_TTLS_MS: ${RETRY_TTLS_MS:-5000,10000,20000}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      WEBHOOK_TIMEOUT_S: ${WEBHOOK_TIMEOUT_S:-10.0}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: on-failure
+  api-test:
+    build:
+      context: .
+      target: tests
+    command: pytest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-payments}
+      DB_PASSWORD: ${DB_PASSWORD:-payments}
+      DB_NAME: ${DB_NAME:-payments}
+      RABBIT_URL: amqp://${RABBITMQ_DEFAULT_USER:-payments}:${RABBITMQ_DEFAULT_PASS:-payments}@rabbitmq:5672/
+      API_KEYS: ${API_KEYS:-changeme}
+      RETRY_TTLS_MS: 1000,1000,1000
+      GATEWAY_SUCCESS_RATE: "1.0"
+      GATEWAY_DELAY_MIN_S: "0"
+      GATEWAY_DELAY_MAX_S: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - test
+  webhook-mock:
+    build: .
+    command: python /app/scripts/webhook_mock.py
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      FAIL_FIRST_N: ${WEBHOOK_FAIL_FIRST_N:-0}
+    ports:
+      - "127.0.0.1:18080:8080"
+    restart: on-failure
+volumes:
+  pgdata:
+  rabbitdata:

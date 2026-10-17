@@ -1,0 +1,16 @@
+.git
+.venv
+.env
+__pycache__
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.ai
+compose.yml
+Dockerfile
+.dockerignore
+*.md
+.DS_Store
+*.egg-info
+**/*.egg-info
