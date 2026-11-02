@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payment_service.config import AppSettings, get_settings
 from payment_service.payments.models import Payment
-from payment_service.payments.service import get_by_id
+from payment_service.payments.repository import PaymentRepository
 
 
 async def verify_api_key(
@@ -29,11 +29,17 @@ async def get_session(request: Request) -> AsyncGenerator[AsyncSession]:
         yield session
 
 
+async def get_payment_repository(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> PaymentRepository:
+    return PaymentRepository(session)
+
+
 async def valid_payment_id(
     payment_id: UUID,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    repo: Annotated[PaymentRepository, Depends(get_payment_repository)],
 ) -> Payment:
-    payment = await get_by_id(session, payment_id)
+    payment = await repo.get(payment_id)
     if payment is None:
         raise HTTPException(status_code=404, detail="payment not found")
     return payment

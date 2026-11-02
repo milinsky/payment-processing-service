@@ -7,6 +7,7 @@ import structlog.testing
 from faststream.exceptions import NackMessage, RejectMessage
 
 from payment_service.messaging.events import PaymentCreatedEvent, PaymentEventData
+from payment_service.payments.exceptions import PaymentBusyError
 from payment_service.processing.retry import (
     RETRY_COUNT_HEADER,
     DeadLetter,
@@ -80,6 +81,18 @@ async def test_first_failure_publishes_to_retry_1() -> None:
     assert published_routing_key(broker) == "payments.retry.1"
     assert published_headers(broker)[RETRY_COUNT_HEADER] == 1
     assert broker.publish.call_args.args[0] == BODY
+
+
+async def test_busy_error_schedules_retry() -> None:
+    broker = make_broker()
+    processor = make_processor(PaymentBusyError())
+    result = await handle_with_retry(
+        broker, processor, BODY, {}, make_event(), max_attempts=3
+    )
+    assert result == "retry_scheduled"
+    assert broker.publish.await_count == 1
+    assert published_routing_key(broker) == "payments.retry.1"
+    assert published_headers(broker)[RETRY_COUNT_HEADER] == 1
 
 
 async def test_third_attempt_failure_publishes_to_retry_3() -> None:

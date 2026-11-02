@@ -2,15 +2,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment_service.payments import service as payments_service
 from payment_service.payments.dependencies import (
-    get_session,
+    get_payment_repository,
     valid_payment_id,
     verify_api_key,
 )
 from payment_service.payments.models import Payment
+from payment_service.payments.repository import PaymentRepository
 from payment_service.payments.schemas import PaymentCreate, PaymentRead
 
 router = APIRouter(
@@ -81,9 +81,9 @@ async def create_payment(
             max_length=IDEMPOTENCY_KEY_MAX_LENGTH,
         ),
     ],
-    session: Annotated[AsyncSession, Depends(get_session)],
+    repo: Annotated[PaymentRepository, Depends(get_payment_repository)],
 ) -> PaymentRead | JSONResponse:
-    result = await payments_service.create_idempotent(session, payload, idempotency_key)
+    result = await payments_service.create_idempotent(repo, payload, idempotency_key)
     if result.replayed:
         return JSONResponse(
             content=_to_read(result.payment).model_dump(mode="json"),

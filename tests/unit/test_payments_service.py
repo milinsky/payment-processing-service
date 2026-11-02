@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from payment_service.outbox.models import Outbox
 from payment_service.payments.exceptions import IdempotencyKeyConflict
 from payment_service.payments.models import Currency, Payment
 from payment_service.payments.schemas import PaymentCreate
@@ -12,6 +11,7 @@ from payment_service.payments.service import (
     _is_idempotency_violation,
     create_idempotent,
     fingerprint,
+    get_by_id,
 )
 
 pytestmark = pytest.mark.unit
@@ -31,15 +31,16 @@ def sample_cmd() -> PaymentCreate:
     )
 
 
-def make_session() -> MagicMock:
-    session = MagicMock()
-    session.flush = AsyncMock()
-    session.commit = AsyncMock()
-    session.rollback = AsyncMock()
-    execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = None
-    session.execute = AsyncMock(return_value=execute_result)
-    return session
+def make_repo() -> MagicMock:
+    repo = MagicMock()
+    repo.get = AsyncMock()
+    repo.get_by_idempotency_key = AsyncMock(return_value=None)
+    repo.add = MagicMock()
+    repo.add_created_event = MagicMock()
+    repo.flush = AsyncMock()
+    repo.commit = AsyncMock()
+    repo.rollback = AsyncMock()
+    return repo
 
 
 def existing_payment(cmd: PaymentCreate, key: str) -> Payment:
@@ -58,51 +59,65 @@ def test_fingerprint_reference_vector() -> None:
     assert fingerprint(sample_cmd()) == EXPECTED_FINGERPRINT
 
 
+async def test_get_by_id_delegates_to_repository() -> None:
+    repo = make_repo()
+    payment_id = uuid.uuid4()
+    await get_by_id(repo, payment_id)
+    repo.get.assert_awaited_once_with(payment_id)
+
+
+async def test_get_by_id_returns_payment_from_repository() -> None:
+    repo = make_repo()
+    payment = existing_payment(sample_cmd(), "key-get-by-id")
+    repo.get = AsyncMock(return_value=payment)
+    assert await get_by_id(repo, payment.id) is payment
+
+
 async def test_insert_first_statement_order() -> None:
-    session = make_session()
-    await create_idempotent(session, sample_cmd(), "key-unit-1")
-    call_names = [call[0] for call in session.method_calls]
-    assert call_names == ["add", "flush", "add", "commit"]
-    assert session.execute.await_count == 0
+    repo = make_repo()
+    await create_idempotent(repo, sample_cmd(), "key-unit-1")
+    call_names = [call[0] for call in repo.method_calls]
+    assert call_names == ["add", "flush", "add_created_event", "commit"]
+    assert repo.get_by_idempotency_key.await_count == 0
 
 
-async def test_happy_path_adds_outbox_before_commit() -> None:
-    session = make_session()
-    result = await create_idempotent(session, sample_cmd(), "key-unit-2")
+async def test_happy_path_adds_payment_and_event_before_commit() -> None:
+    repo = make_repo()
+    result = await create_idempotent(repo, sample_cmd(), "key-unit-2")
     assert result.replayed is False
-    added = [call.args[0] for call in session.method_calls if call[0] == "add"]
-    assert isinstance(added[0], Payment)
-    assert isinstance(added[1], Outbox)
-    event = added[1]
-    assert event.event_type == "payment.created"
-    assert event.aggregate_type == "payment"
-    assert event.aggregate_id == result.payment.id
-    assert event.payload == {"payment_id": str(result.payment.id)}
+    forwarded = [
+        call.args[0]
+        for call in repo.method_calls
+        if call[0] in {"add", "add_created_event"}
+    ]
+    assert isinstance(forwarded[0], Payment)
+    assert forwarded[1] is result.payment
     commit_index = next(
-        i for i, call in enumerate(session.method_calls) if call[0] == "commit"
+        i for i, call in enumerate(repo.method_calls) if call[0] == "commit"
     )
-    add_indices = [i for i, call in enumerate(session.method_calls) if call[0] == "add"]
-    assert all(index < commit_index for index in add_indices)
+    write_indices = [
+        i
+        for i, call in enumerate(repo.method_calls)
+        if call[0] in {"add", "add_created_event"}
+    ]
+    assert all(index < commit_index for index in write_indices)
 
 
 async def test_integrity_error_replays_existing_payment() -> None:
-    session = make_session()
+    repo = make_repo()
     cmd = sample_cmd()
     key = "key-unit-3"
     existing = existing_payment(cmd, key)
-    session.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
-    session.rollback = AsyncMock()
-    execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = existing
-    session.execute = AsyncMock(return_value=execute_result)
-    result = await create_idempotent(session, cmd, key)
+    repo.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
+    repo.get_by_idempotency_key = AsyncMock(return_value=existing)
+    result = await create_idempotent(repo, cmd, key)
     assert result.replayed is True
     assert result.payment is existing
-    session.rollback.assert_awaited_once()
+    repo.rollback.assert_awaited_once()
 
 
 async def test_integrity_error_with_other_fingerprint_conflicts() -> None:
-    session = make_session()
+    repo = make_repo()
     cmd = sample_cmd()
     key = "key-unit-4"
     other = Payment(
@@ -114,21 +129,19 @@ async def test_integrity_error_with_other_fingerprint_conflicts() -> None:
         request_fingerprint="f" * 64,
         webhook_url=str(cmd.webhook_url),
     )
-    session.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
-    execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = other
-    session.execute = AsyncMock(return_value=execute_result)
+    repo.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
+    repo.get_by_idempotency_key = AsyncMock(return_value=other)
     with pytest.raises(IdempotencyKeyConflict) as excinfo:
-        await create_idempotent(session, cmd, key)
+        await create_idempotent(repo, cmd, key)
     assert excinfo.value.idempotency_key == key
 
 
 async def test_foreign_integrity_error_is_reraised() -> None:
-    session = make_session()
-    session.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
+    repo = make_repo()
+    repo.flush = AsyncMock(side_effect=IntegrityError("stmt", {}, RuntimeError()))
     with pytest.raises(IntegrityError):
-        await create_idempotent(session, sample_cmd(), "key-unit-5")
-    session.rollback.assert_awaited_once()
+        await create_idempotent(repo, sample_cmd(), "key-unit-5")
+    repo.rollback.assert_awaited_once()
 
 
 def integrity_error_with_constraint(constraint_name: str | None) -> IntegrityError:
@@ -146,32 +159,26 @@ def integrity_error_with_sqlstate(sqlstate: str) -> IntegrityError:
 
 
 async def test_foreign_sqlstate_error_is_reraised_even_with_existing_row() -> None:
-    session = make_session()
+    repo = make_repo()
     cmd = sample_cmd()
     key = "key-unit-6"
     existing = existing_payment(cmd, key)
-    session.flush = AsyncMock(side_effect=integrity_error_with_sqlstate("23502"))
-    session.rollback = AsyncMock()
-    execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = existing
-    session.execute = AsyncMock(return_value=execute_result)
+    repo.flush = AsyncMock(side_effect=integrity_error_with_sqlstate("23502"))
+    repo.get_by_idempotency_key = AsyncMock(return_value=existing)
     with pytest.raises(IntegrityError):
-        await create_idempotent(session, cmd, key)
+        await create_idempotent(repo, cmd, key)
 
 
 async def test_idempotency_constraint_error_replays() -> None:
-    session = make_session()
+    repo = make_repo()
     cmd = sample_cmd()
     key = "key-unit-7"
     existing = existing_payment(cmd, key)
-    session.flush = AsyncMock(
+    repo.flush = AsyncMock(
         side_effect=integrity_error_with_constraint("payments_idempotency_key_key")
     )
-    session.rollback = AsyncMock()
-    execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = existing
-    session.execute = AsyncMock(return_value=execute_result)
-    result = await create_idempotent(session, cmd, key)
+    repo.get_by_idempotency_key = AsyncMock(return_value=existing)
+    result = await create_idempotent(repo, cmd, key)
     assert result.replayed is True
 
 

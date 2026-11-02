@@ -32,6 +32,7 @@ from payment_service.messaging.topology import (
     payments_exchange,
 )
 from payment_service.payments.models import Payment, PaymentStatus
+from payment_service.payments.repository import PaymentRepository
 from payment_service.payments.schemas import PaymentCreate
 from payment_service.payments.service import create_idempotent
 
@@ -192,7 +193,7 @@ async def test_dead_webhook_reaches_dlq_payment_terminal_idempotent_redelivery(
     db_session: AsyncSession,
 ) -> None:
     creation = await create_idempotent(
-        db_session,
+        PaymentRepository(db_session),
         PaymentCreate(
             amount="100.00",
             currency="RUB",

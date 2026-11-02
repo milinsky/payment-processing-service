@@ -1,13 +1,19 @@
 import inspect
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 
 from payment_service.config import get_settings
 from payment_service.payments import dependencies
-from payment_service.payments.dependencies import get_session, verify_api_key
+from payment_service.payments.dependencies import (
+    get_payment_repository,
+    get_session,
+    verify_api_key,
+)
+from payment_service.payments.repository import PaymentRepository
 
 pytestmark = pytest.mark.unit
 
@@ -87,3 +93,22 @@ async def test_get_session_yields_from_state_maker(
         break
     assert isinstance(yielded, FakeSession)
     assert sessions == [yielded]
+
+
+async def test_get_payment_repository_wraps_session() -> None:
+    class FakeSession:
+        async def get(self, model: type[object], ident: object) -> None:
+            return None
+
+    session: Any = FakeSession()
+    repo = await get_payment_repository(session)
+    assert isinstance(repo, PaymentRepository)
+    assert await repo.get(uuid4()) is None
+
+
+def test_get_payment_repository_depends_on_get_session() -> None:
+    annotation = (
+        inspect.signature(get_payment_repository).parameters["session"].annotation
+    )
+    depends = get_args(annotation)[1]
+    assert depends.dependency is get_session

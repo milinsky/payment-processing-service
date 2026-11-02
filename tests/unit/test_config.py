@@ -68,8 +68,50 @@ def test_processing_defaults() -> None:
     assert processing.success_rate == 0.9
     assert processing.delay_min_s == 2.0
     assert processing.delay_max_s == 5.0
+    assert processing.timeout_s == 15.0
+    assert processing.lease_ttl_s == 25.0
     assert processing.retry_ttls_ms == [5000, 10000, 20000]
     assert processing.retry_max_attempts == 3
+
+
+def test_processing_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GATEWAY_TIMEOUT_S", "5")
+    processing = ProcessingSettings()
+    assert processing.timeout_s == 5.0
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_processing_timeout_must_be_positive(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ProcessingSettings(timeout_s=value)
+
+
+def test_processing_timeout_equal_to_lease_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ProcessingSettings(timeout_s=25.0, lease_ttl_s=25.0)
+
+
+def test_processing_timeout_greater_than_lease_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ProcessingSettings(timeout_s=30.0, lease_ttl_s=25.0)
+
+
+def test_processing_timeout_below_lease_accepted() -> None:
+    processing = ProcessingSettings(timeout_s=0.1, lease_ttl_s=25.0)
+    assert processing.timeout_s == 0.1
+    assert processing.lease_ttl_s == 25.0
+
+
+def test_processing_lease_ttl_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GATEWAY_LEASE_TTL_S", "60")
+    processing = ProcessingSettings()
+    assert processing.lease_ttl_s == 60.0
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_processing_lease_ttl_must_be_positive(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ProcessingSettings(lease_ttl_s=value)
 
 
 def test_processing_success_rate_out_of_range() -> None:
@@ -111,6 +153,7 @@ def test_outbox_defaults() -> None:
     outbox = OutboxSettings()
     assert outbox.retention_s == 86400.0
     assert outbox.cleanup_interval_s == 3600.0
+    assert outbox.max_held_sessions == 10
 
 
 def test_outbox_retention_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,6 +167,20 @@ def test_outbox_retention_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_outbox_retention_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         OutboxSettings(retention_s=0)
+
+
+def test_outbox_max_held_sessions_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OUTBOX_MAX_HELD_SESSIONS", "3")
+    outbox = OutboxSettings()
+    assert outbox.max_held_sessions == 3
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_outbox_max_held_sessions_must_be_positive(value: int) -> None:
+    with pytest.raises(ValidationError):
+        OutboxSettings(max_held_sessions=value)
 
 
 def test_log_level_defaults_and_normalization() -> None:

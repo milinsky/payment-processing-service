@@ -5,13 +5,11 @@ from uuid import UUID
 
 import structlog
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from payment_service.outbox.models import Outbox
 from payment_service.payments.exceptions import IdempotencyKeyConflict
 from payment_service.payments.models import Payment, PaymentStatus
+from payment_service.payments.repository import PaymentRepository
 from payment_service.payments.schemas import PaymentCreate
 
 logger = structlog.get_logger(__name__)
@@ -48,28 +46,12 @@ def fingerprint(cmd: PaymentCreate) -> str:
     return hashlib.sha256(canonical_json(cmd).encode()).hexdigest()
 
 
-async def get_by_id(session: AsyncSession, payment_id: UUID) -> Payment | None:
-    return await session.get(Payment, payment_id)
-
-
-async def _get_by_key(session: AsyncSession, idempotency_key: str) -> Payment | None:
-    result = await session.execute(
-        select(Payment).where(Payment.idempotency_key == idempotency_key)
-    )
-    return result.scalar_one_or_none()
-
-
-def _created_event(payment: Payment) -> Outbox:
-    return Outbox(
-        aggregate_type="payment",
-        aggregate_id=payment.id,
-        event_type="payment.created",
-        payload={"payment_id": str(payment.id)},
-    )
+async def get_by_id(repo: PaymentRepository, payment_id: UUID) -> Payment | None:
+    return await repo.get(payment_id)
 
 
 async def create_idempotent(
-    session: AsyncSession,
+    repo: PaymentRepository,
     cmd: PaymentCreate,
     idempotency_key: str,
 ) -> PaymentCreationResult:
@@ -83,16 +65,16 @@ async def create_idempotent(
         request_fingerprint=fingerprint(cmd),
         webhook_url=str(cmd.webhook_url),
     )
-    session.add(payment)
+    repo.add(payment)
     try:
-        await session.flush()
-        session.add(_created_event(payment))
-        await session.commit()
+        await repo.flush()
+        repo.add_created_event(payment)
+        await repo.commit()
     except IntegrityError as exc:
-        await session.rollback()
+        await repo.rollback()
         if not _is_idempotency_violation(exc):
             raise
-        existing = await _get_by_key(session, idempotency_key)
+        existing = await repo.get_by_idempotency_key(idempotency_key)
         if existing is None:
             raise
         if existing.request_fingerprint != payment.request_fingerprint:

@@ -39,6 +39,7 @@ _EXPECTED_PAYMENTS_NULLABILITY = {
     "webhook_url": "NO",
     "created_at": "NO",
     "processed_at": "YES",
+    "processing_claimed_until": "YES",
     "webhook_delivered_at": "YES",
     "webhook_attempts": "NO",
 }

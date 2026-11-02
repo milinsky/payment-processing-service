@@ -56,7 +56,15 @@ async def setup() -> None:
             settings.processing.delay_max_s,
         ),
         runtime.webhook,
+        settings.processing,
     )
+    retry_budget_s = sum(settings.processing.retry_ttls_ms) / 1000
+    if retry_budget_s <= settings.processing.lease_ttl_s:
+        logger.warning(
+            "retry_budget_does_not_exceed_lease_ttl",
+            retry_budget_s=retry_budget_s,
+            lease_ttl_s=settings.processing.lease_ttl_s,
+        )
     logger.info("consumer_started")
 
 

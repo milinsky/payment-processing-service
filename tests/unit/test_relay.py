@@ -1,6 +1,7 @@
 import asyncio
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -27,65 +28,119 @@ def outbox_row(row_id: int, event_id: UUID | None = None) -> Outbox:
     )
 
 
+@dataclass
+class RelayState:
+    journal: list[str] = field(default_factory=list)
+    marked: list[list[int]] = field(default_factory=list)
+    published: list[str] = field(default_factory=list)
+    pending: list[Outbox] = field(default_factory=list)
+    dispatched: set[int] = field(default_factory=set)
+    holders: dict[int, Any] = field(default_factory=dict)
+    closed: set[Any] = field(default_factory=set)
+    sessions: list[Any] = field(default_factory=list)
+    fetch_error: BaseException | None = None
+
+
+class RepositoryStub:
+    def __init__(self, session: Any, state: RelayState) -> None:
+        self._session = session
+        self._state = state
+
+    async def fetch_next_pending(self) -> Outbox | None:
+        self._state.journal.append("fetch")
+        if self._state.fetch_error is not None:
+            raise self._state.fetch_error
+        for row in self._state.pending:
+            if row.id in self._state.dispatched:
+                continue
+            holder = self._state.holders.get(row.id)
+            if holder is not None and holder not in self._state.closed:
+                continue
+            self._state.holders[row.id] = self._session
+            return row
+        return None
+
+    async def mark_dispatched(self, row_ids: Sequence[int]) -> None:
+        self._state.journal.append("mark")
+        self._state.marked.append(list(row_ids))
+        self._state.dispatched.update(row_ids)
+
+
+def make_session_stub(state: RelayState) -> Any:
+    session: Any = MagicMock()
+
+    async def commit() -> None:
+        state.journal.append("commit")
+
+    async def close() -> None:
+        state.journal.append("close")
+        state.closed.add(session)
+
+    session.commit = AsyncMock(side_effect=commit)
+    session.close = AsyncMock(side_effect=close)
+    return session
+
+
 def make_relay_parts(
+    monkeypatch: pytest.MonkeyPatch,
     pending: list[Outbox],
     publish_side_effect: Callable[..., Any] | None = None,
     poll_interval_s: float = 0.5,
-) -> tuple[OutboxRelay, MagicMock, list[str], list[Any]]:
-    if publish_side_effect is None:
-
-        def publish_side_effect(*args: Any, **kwargs: Any) -> None:
-            return None
-
-    calls: list[str] = []
-    update_statements: list[Any] = []
-    broker = MagicMock()
+    batch_size: int = 100,
+    fetch_error: BaseException | None = None,
+    max_held_sessions: int = 10,
+) -> tuple[OutboxRelay, MagicMock, RelayState]:
+    state = RelayState(pending=pending, fetch_error=fetch_error)
 
     async def publish_wrapper(*args: Any, **kwargs: Any) -> Any:
-        calls.append("publish")
-        result = publish_side_effect(*args, **kwargs)
+        state.journal.append("publish")
+        state.published.append(str(kwargs["message_id"]))
+        result = publish_side_effect(*args, **kwargs) if publish_side_effect else None
         if inspect.isawaitable(result):
             await result
         return result
 
+    broker = MagicMock()
     broker.publish = AsyncMock(side_effect=publish_wrapper)
-    session: Any = MagicMock()
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
-    begin_ctx: Any = MagicMock()
-    begin_ctx.__aenter__ = AsyncMock(return_value=None)
-    begin_ctx.__aexit__ = AsyncMock(return_value=False)
-    session.begin = MagicMock(return_value=begin_ctx)
-    select_result = MagicMock()
-    select_result.scalars.return_value.all.return_value = pending
-    execute_count = 0
 
-    async def execute_side_effect(statement: Any, *args: Any, **kwargs: Any) -> Any:
-        nonlocal execute_count
-        execute_count += 1
-        if execute_count == 1:
-            calls.append("select")
-            return select_result
-        calls.append("update")
-        update_statements.append(statement)
-        return MagicMock()
+    def make_session() -> Any:
+        session = make_session_stub(state)
+        state.sessions.append(session)
+        return session
 
-    session.execute = AsyncMock(side_effect=execute_side_effect)
-    maker = MagicMock(return_value=session)
+    def make_repo(session: Any) -> RepositoryStub:
+        return RepositoryStub(session, state)
+
+    monkeypatch.setattr("payment_service.outbox.relay.OutboxRepository", make_repo)
+    maker = MagicMock(side_effect=make_session)
     settings: Any = MagicMock()
     settings.outbox.poll_interval_s = poll_interval_s
-    settings.outbox.batch_size = 100
+    settings.outbox.batch_size = batch_size
+    settings.outbox.max_held_sessions = max_held_sessions
     relay = OutboxRelay(broker, maker, settings)
-    return relay, broker, calls, update_statements
+    return relay, broker, state
 
 
-async def test_publish_happens_between_select_and_update() -> None:
-    relay, broker, calls, _ = make_relay_parts([outbox_row(1)])
+async def test_fetch_publish_mark_commit_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay, broker, state = make_relay_parts(monkeypatch, [outbox_row(1)])
     await relay.run_once()
-    assert calls == ["select", "publish", "update"]
+    assert state.journal == [
+        "fetch",
+        "publish",
+        "mark",
+        "commit",
+        "close",
+        "fetch",
+        "close",
+    ]
+    assert state.marked == [[1]]
 
 
-async def test_failed_publish_marks_only_successful_rows() -> None:
+async def test_failed_publish_marks_only_successful_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     failing_row = outbox_row(1)
     successful_row = outbox_row(2)
     attempts: list[int] = []
@@ -96,29 +151,89 @@ async def test_failed_publish_marks_only_successful_rows() -> None:
             raise RuntimeError("broker down")
         return None
 
-    relay, broker, calls, update_statements = make_relay_parts(
-        [failing_row, successful_row], publish_side_effect=publish_side_effect
+    relay, broker, state = make_relay_parts(
+        monkeypatch,
+        [failing_row, successful_row],
+        publish_side_effect=publish_side_effect,
     )
     await relay.run_once()
-    assert calls == ["select", "publish", "publish", "update"]
-    compiled = str(update_statements[0].compile(compile_kwargs={"literal_binds": True}))
-    assert "dispatched_at" in compiled
-    assert "IN (2)" in compiled
-    assert "IN (1, 2)" not in compiled
+    assert state.journal == [
+        "fetch",
+        "publish",
+        "fetch",
+        "publish",
+        "mark",
+        "commit",
+        "close",
+        "fetch",
+        "close",
+        "close",
+    ]
+    assert state.published == [
+        str(failing_row.event_id),
+        str(successful_row.event_id),
+    ]
+    assert state.marked == [[successful_row.id]]
+    failed_session = state.sessions[0]
+    failed_session.commit.assert_not_awaited()
+    failed_session.close.assert_awaited_once()
+    successful_session = state.sessions[1]
+    successful_session.commit.assert_awaited_once()
+
+
+async def test_publish_failures_stop_loop_at_held_session_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [outbox_row(1), outbox_row(2), outbox_row(3), outbox_row(4)]
+
+    def publish_side_effect(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("broker down")
+
+    relay, broker, state = make_relay_parts(
+        monkeypatch,
+        rows,
+        publish_side_effect=publish_side_effect,
+        max_held_sessions=2,
+    )
+    await relay.run_once()
+    assert len(state.sessions) == 2
+    assert broker.publish.await_count == 2
+    assert state.published == [str(rows[0].event_id), str(rows[1].event_id)]
+    assert state.marked == []
+    assert state.journal == [
+        "fetch",
+        "publish",
+        "fetch",
+        "publish",
+        "close",
+        "close",
+    ]
+
+
+async def test_run_once_processes_at_most_batch_size_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [outbox_row(1), outbox_row(2), outbox_row(3)]
+    relay, broker, state = make_relay_parts(monkeypatch, rows, batch_size=2)
+    await relay.run_once()
+    assert state.published == [str(rows[0].event_id), str(rows[1].event_id)]
+    assert state.marked == [[1], [2]]
+    assert 3 not in state.dispatched
 
 
 async def test_empty_batch_never_publishes(monkeypatch: pytest.MonkeyPatch) -> None:
-    relay, broker, calls, _ = make_relay_parts([], poll_interval_s=0.25)
-    assert calls == []
+    relay, broker, state = make_relay_parts(monkeypatch, [], poll_interval_s=0.25)
+    assert state.journal == []
     await relay.run_once()
-    assert calls == ["select"]
+    assert state.journal == ["fetch", "close"]
+    assert state.marked == []
     broker.publish.assert_not_awaited()
 
 
 async def test_run_sleeps_poll_interval_between_iterations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    relay, broker, _, _ = make_relay_parts([], poll_interval_s=0.75)
+    relay, broker, _ = make_relay_parts(monkeypatch, [], poll_interval_s=0.75)
     sleep_delays: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -131,8 +246,10 @@ async def test_run_sleeps_poll_interval_between_iterations(
     broker.publish.assert_not_awaited()
 
 
-async def test_run_returns_cleanly_on_cancel() -> None:
-    relay, broker, _, _ = make_relay_parts([], poll_interval_s=0.01)
+async def test_run_returns_cleanly_on_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay, broker, _ = make_relay_parts(monkeypatch, [], poll_interval_s=0.01)
     task = asyncio.create_task(relay.run())
     await asyncio.sleep(0)
     task.cancel()
@@ -143,16 +260,12 @@ async def test_run_returns_cleanly_on_cancel() -> None:
 async def test_run_survives_database_error_and_continues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session: Any = MagicMock()
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
-    session.execute = AsyncMock(side_effect=RuntimeError("database unavailable"))
-    maker = MagicMock(return_value=session)
-    broker = MagicMock()
-    broker.publish = AsyncMock()
-    settings: Any = MagicMock()
-    settings.outbox.poll_interval_s = 0.3
-    relay = OutboxRelay(broker, maker, settings)
+    relay, broker, _ = make_relay_parts(
+        monkeypatch,
+        [],
+        poll_interval_s=0.3,
+        fetch_error=RuntimeError("database unavailable"),
+    )
     sleep_delays: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -171,14 +284,12 @@ async def test_run_logs_iteration_failure_with_traceback(
 ) -> None:
     capture = structlog.testing.CapturingLogger()
     monkeypatch.setattr("payment_service.outbox.relay.logger", capture)
-    session: Any = MagicMock()
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
-    session.execute = AsyncMock(side_effect=RuntimeError("database unavailable"))
-    maker = MagicMock(return_value=session)
-    settings: Any = MagicMock()
-    settings.outbox.poll_interval_s = 0.3
-    relay = OutboxRelay(MagicMock(), maker, settings)
+    relay, _, _ = make_relay_parts(
+        monkeypatch,
+        [],
+        poll_interval_s=0.3,
+        fetch_error=RuntimeError("database unavailable"),
+    )
 
     async def fake_sleep(delay: float) -> None:
         raise asyncio.CancelledError
@@ -201,8 +312,8 @@ async def test_publish_failure_is_logged_with_traceback(
     async def publish_side_effect(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("broker down")
 
-    relay, broker, calls, _ = make_relay_parts(
-        [row], publish_side_effect=publish_side_effect
+    relay, _, state = make_relay_parts(
+        monkeypatch, [row], publish_side_effect=publish_side_effect
     )
     await relay.run_once()
     warnings = [call for call in capture.calls if call.method_name == "warning"]
@@ -210,63 +321,59 @@ async def test_publish_failure_is_logged_with_traceback(
     assert warnings[0].args == ("outbox_publish_failed",)
     assert warnings[0].kwargs["exc_info"] is True
     assert warnings[0].kwargs["event_id"] == str(row.event_id)
+    assert state.marked == []
 
 
-async def test_cycle_processes_next_batch_after_publish_failure() -> None:
-    journal: list[str] = []
-    broker = MagicMock()
+async def test_failed_row_republished_on_next_run_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = outbox_row(1)
     attempts: list[int] = []
 
-    async def publish_wrapper(*args: Any, **kwargs: Any) -> Any:
-        journal.append("publish")
-        if len(attempts) == 0:
-            attempts.append(1)
+    def publish_side_effect(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
             raise RuntimeError("broker hiccup")
-        attempts.append(2)
         return None
 
-    broker.publish = AsyncMock(side_effect=publish_wrapper)
-    settings: Any = MagicMock()
-    settings.outbox.batch_size = 100
-    sessions: list[Any] = []
-    for pending in ([outbox_row(1)], [outbox_row(2)]):
-        session: Any = MagicMock()
-        session.__aenter__ = AsyncMock(return_value=session)
-        session.__aexit__ = AsyncMock(return_value=False)
-        begin_ctx: Any = MagicMock()
-        begin_ctx.__aenter__ = AsyncMock(return_value=None)
-        begin_ctx.__aexit__ = AsyncMock(return_value=False)
-        session.begin = MagicMock(return_value=begin_ctx)
-        select_result = MagicMock()
-        select_result.scalars.return_value.all.return_value = pending
-        session.execute = AsyncMock(
-            side_effect=[select_result, MagicMock(), MagicMock()]
-        )
-        sessions.append(session)
-    maker = MagicMock(side_effect=sessions)
-    relay = OutboxRelay(broker, maker, settings)
-    await relay.run_once()
-    await relay.run_once()
-    assert journal == ["publish", "publish"]
-    second_update = sessions[1].execute.call_args_list[1]
-    compiled = str(
-        second_update.args[0].compile(compile_kwargs={"literal_binds": True})
+    relay, _, state = make_relay_parts(
+        monkeypatch, [row], publish_side_effect=publish_side_effect
     )
-    assert "dispatched_at" in compiled
-    assert "IN (2)" in compiled
+    await relay.run_once()
+    assert state.marked == []
+    await relay.run_once()
+    assert state.journal == [
+        "fetch",
+        "publish",
+        "fetch",
+        "close",
+        "close",
+        "fetch",
+        "publish",
+        "mark",
+        "commit",
+        "close",
+        "fetch",
+        "close",
+    ]
+    assert state.published == [str(row.event_id), str(row.event_id)]
+    assert state.marked == [[row.id]]
 
 
-async def test_cancelled_publish_propagates_out_of_run_once() -> None:
+async def test_cancelled_publish_propagates_out_of_run_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def publish_cancel(*args: Any, **kwargs: Any) -> Any:
         raise asyncio.CancelledError
 
     row = outbox_row(1)
-    relay, broker, calls, _ = make_relay_parts(
-        [row], publish_side_effect=publish_cancel
+    relay, broker, state = make_relay_parts(
+        monkeypatch, [row], publish_side_effect=publish_cancel
     )
     with pytest.raises(asyncio.CancelledError):
         await relay.run_once()
-    assert calls == ["select", "publish"]
+    assert state.journal == ["fetch", "publish", "close"]
+    assert state.marked == []
 
 
 def make_retention_parts(

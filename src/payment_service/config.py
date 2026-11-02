@@ -69,6 +69,8 @@ class ProcessingSettings(BaseSettings):
     success_rate: float = Field(0.9, ge=0, le=1)
     delay_min_s: float = 2.0
     delay_max_s: float = 5.0
+    timeout_s: float = Field(15.0, gt=0)
+    lease_ttl_s: float = Field(25.0, gt=0)
     retry_ttls_ms: Annotated[list[int], NoDecode] = Field(
         default=[5000, 10000, 20000], validation_alias="RETRY_TTLS_MS"
     )
@@ -85,6 +87,12 @@ class ProcessingSettings(BaseSettings):
             raise ValueError(
                 "retry_max_attempts cannot exceed number of RETRY_TTLS_MS entries"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_timeout_within_lease(self) -> Self:
+        if not self.timeout_s < self.lease_ttl_s:
+            raise ValueError("timeout_s must be less than lease_ttl_s")
         return self
 
 
@@ -109,6 +117,7 @@ class OutboxSettings(BaseSettings):
     batch_size: int = 100
     retention_s: float = Field(default=86400.0, gt=0)
     cleanup_interval_s: float = Field(default=3600.0, gt=0)
+    max_held_sessions: int = Field(default=10, gt=0)
 
 
 class AppSettings(BaseModel):

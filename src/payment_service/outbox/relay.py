@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from faststream.rabbit import RabbitBroker
-from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payment_service.config import AppSettings
@@ -13,6 +12,7 @@ from payment_service.messaging.topology import (
     payments_exchange,
 )
 from payment_service.outbox.models import Outbox
+from payment_service.outbox.repository import OutboxRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -57,58 +57,58 @@ class OutboxRelay:
         except asyncio.CancelledError:
             return
 
-    async def fetch_batch(self, session: AsyncSession) -> list[Outbox]:
-        rows = await session.execute(
-            select(Outbox)
-            .where(Outbox.dispatched_at.is_(None))
-            .order_by(Outbox.id)
-            .limit(self._settings.outbox.batch_size)
-            .with_for_update(skip_locked=True)
-        )
-        return list(rows.scalars().all())
-
-    def _expired_ids_statement(self) -> Select[int]:
-        retention = timedelta(seconds=self._settings.outbox.retention_s)
-        cutoff = datetime.now(UTC) - retention
-        return (
-            select(Outbox.id)
-            .where(Outbox.dispatched_at.is_not(None), Outbox.dispatched_at < cutoff)
-            .limit(self._settings.outbox.batch_size)
-        )
-
     async def cleanup_expired(self) -> int:
         async with self._sessionmaker() as session:
-            result = await session.execute(
-                delete(Outbox).where(Outbox.id.in_(self._expired_ids_statement()))
+            repo = OutboxRepository(session)
+            retention = timedelta(seconds=self._settings.outbox.retention_s)
+            cutoff = datetime.now(UTC) - retention
+            removed = await repo.delete_expired(
+                cutoff, self._settings.outbox.batch_size
             )
             await session.commit()
-            return int(getattr(result, "rowcount", 0) or 0)
+            return removed
 
     async def run_once(self) -> None:
-        async with self._sessionmaker() as session, session.begin():
-            pending = await self.fetch_batch(session)
-            if not pending:
-                return
-            dispatched: list[int] = []
-            for row in pending:
+        held_sessions: list[AsyncSession] = []
+        dispatched = 0
+        processed = 0
+        try:
+            for _ in range(self._settings.outbox.batch_size):
+                session = self._sessionmaker()
+                publish_failed = False
                 try:
-                    await self._publish(row)
-                    dispatched.append(row.id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "outbox_publish_failed",
-                        event_id=str(row.event_id),
-                        exc_info=True,
-                    )
-            if dispatched:
-                await session.execute(
-                    update(Outbox)
-                    .where(Outbox.id.in_(dispatched))
-                    .values(dispatched_at=func.now())
-                )
-            logger.info("outbox_batch_dispatched", batch_size=len(dispatched))
+                    repo = OutboxRepository(session)
+                    row = await repo.fetch_next_pending()
+                    if row is None:
+                        break
+                    processed += 1
+                    try:
+                        await self._publish(row)
+                    except Exception:
+                        logger.warning(
+                            "outbox_publish_failed",
+                            event_id=str(row.event_id),
+                            exc_info=True,
+                        )
+                        held_sessions.append(session)
+                        publish_failed = True
+                        if (
+                            len(held_sessions)
+                            >= self._settings.outbox.max_held_sessions
+                        ):
+                            break
+                        continue
+                    await repo.mark_dispatched([row.id])
+                    await session.commit()
+                    dispatched += 1
+                finally:
+                    if not publish_failed:
+                        await session.close()
+        finally:
+            for held_session in held_sessions:
+                await held_session.close()
+        if processed:
+            logger.info("outbox_batch_dispatched", batch_size=dispatched)
 
     async def _publish(self, row: Outbox) -> None:
         event = PaymentCreatedEvent(

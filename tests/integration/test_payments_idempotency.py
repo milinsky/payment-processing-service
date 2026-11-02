@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from payment_service.outbox.models import Outbox
 from payment_service.payments.exceptions import IdempotencyKeyConflict
 from payment_service.payments.models import Currency, Payment, PaymentStatus
+from payment_service.payments.repository import PaymentRepository
 from payment_service.payments.schemas import PaymentCreate
 from payment_service.payments.service import create_idempotent
 
@@ -30,7 +31,9 @@ async def count_payments(session: AsyncSession, key: str) -> int:
 
 
 async def test_create_is_atomic_payment_and_outbox(db_session: AsyncSession) -> None:
-    result = await create_idempotent(db_session, make_cmd(), "key-atomic-1")
+    result = await create_idempotent(
+        PaymentRepository(db_session), make_cmd(), "key-atomic-1"
+    )
     assert result.replayed is False
     assert result.payment.status is PaymentStatus.PENDING
     row = (
@@ -59,7 +62,7 @@ async def test_concurrent_same_key_creates_single_row(
 
     async def run() -> tuple[str, bool]:
         async with maker() as session:
-            result = await create_idempotent(session, cmd, key)
+            result = await create_idempotent(PaymentRepository(session), cmd, key)
             return str(result.payment.id), result.replayed
 
     outcomes = await asyncio.gather(run(), run())
@@ -72,10 +75,14 @@ async def test_concurrent_same_key_creates_single_row(
 async def test_same_key_different_body_conflicts(
     db_session: AsyncSession,
 ) -> None:
-    first = await create_idempotent(db_session, make_cmd("100.00"), "key-conflict-1")
+    first = await create_idempotent(
+        PaymentRepository(db_session), make_cmd("100.00"), "key-conflict-1"
+    )
     assert first.replayed is False
     with pytest.raises(IdempotencyKeyConflict):
-        await create_idempotent(db_session, make_cmd("200.00"), "key-conflict-1")
+        await create_idempotent(
+            PaymentRepository(db_session), make_cmd("200.00"), "key-conflict-1"
+        )
     assert await count_payments(db_session, "key-conflict-1") == 1
 
 
@@ -92,7 +99,9 @@ async def test_failure_between_inserts_leaves_no_rows(
 
         monkeypatch.setattr(session, "commit", failing_commit)
         with pytest.raises(RuntimeError):
-            await create_idempotent(session, make_cmd(), "key-failure-1")
+            await create_idempotent(
+                PaymentRepository(session), make_cmd(), "key-failure-1"
+            )
         await session.rollback()
     payments_count = (
         await db_session.execute(select(func.count()).select_from(Payment))

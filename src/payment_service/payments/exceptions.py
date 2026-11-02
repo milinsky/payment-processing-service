@@ -4,3 +4,7 @@ class IdempotencyKeyConflict(Exception):
             f"idempotency key already used with different body: {idempotency_key}"
         )
         self.idempotency_key = idempotency_key
+
+
+class PaymentBusyError(Exception):
+    pass
