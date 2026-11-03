@@ -13,6 +13,7 @@
 ![FastStream](https://img.shields.io/badge/FastStream-0.7-purple)
 ![mypy](https://img.shields.io/badge/mypy-strict-2b5b84)
 ![Ruff](https://img.shields.io/badge/ruff-0.14-261230)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 An asynchronous payment processing service built around the **transactional outbox pattern**: FastAPI + PostgreSQL + RabbitMQ (FastStream). Beyond the outbox itself, it demonstrates the surrounding reliability machinery a production system needs: idempotent creation, at-least-once delivery with TTL-based exponential retries and a DLQ, lease-based concurrent processing that never holds a database lock across an external call, and a fully dockerized three-process topology (api / relay / consumer).
 
@@ -267,3 +268,9 @@ Debugging from the host: PostgreSQL `localhost:55432` (`payments`/`payments`/`pa
 - Alembic offline mode (`alembic upgrade --sql`) — env.py has no offline branch; migrations run only against a live database.
 - Automatic replay from the DLQ (manual via the management UI only).
 - Multiple relay/consumer instances are supported: relay — row-wise `FOR UPDATE SKIP LOCKED`; consumer — atomic lease claiming: a concurrent duplicate gets busy and flows through TTL retries instead of waiting; a duplicate webhook is still possible — the at-least-once contract applies. Compose runs one instance of each (the spec describes a single consumer; scaling is an orchestration concern).
+
+## License
+
+Copyright © 2026 Mikhail Ilinsky.
+
+This project is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE) for the full text.
