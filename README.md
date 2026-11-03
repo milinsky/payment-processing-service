@@ -1,6 +1,22 @@
 # Payment Processing Service
 
-An asynchronous payment processing service: FastAPI + PostgreSQL + RabbitMQ (FastStream), transactional outbox, broker retries with exponential backoff (TTL queues), DLQ, idempotent payment creation. Processing uses lease-based claiming instead of row locks: no database transaction or lock is held while the payment gateway or webhooks are being called.
+**A demonstration project: a reference implementation of the transactional outbox pattern for asynchronous payment processing.**
+
+[![CI](https://github.com/milinsky/payment-processing-service/actions/workflows/ci.yml/badge.svg)](https://github.com/milinsky/payment-processing-service/actions/workflows/ci.yml)
+![Coverage](https://img.shields.io/badge/branch%20coverage-98.87%25-brightgreen)
+![Tests](https://img.shields.io/badge/tests-246%20passed-success)
+![Python](https://img.shields.io/badge/python-3.14%2B-blue)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-blue)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-4.3-orange)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.143-009688)
+![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.1-red)
+![FastStream](https://img.shields.io/badge/FastStream-0.7-purple)
+![mypy](https://img.shields.io/badge/mypy-strict-2b5b84)
+![Ruff](https://img.shields.io/badge/ruff-0.14-261230)
+
+An asynchronous payment processing service built around the **transactional outbox pattern**: FastAPI + PostgreSQL + RabbitMQ (FastStream). Beyond the outbox itself, it demonstrates the surrounding reliability machinery a production system needs: idempotent creation, at-least-once delivery with TTL-based exponential retries and a DLQ, lease-based concurrent processing that never holds a database lock across an external call, and a fully dockerized three-process topology (api / relay / consumer).
+
+Everything claimed here is enforced by tests rather than asserted in prose: 246 tests across unit / integration / e2e layers, 98.87% branch coverage (85% gate), mypy strict, ruff, and a CI pipeline that runs lint → typecheck → the full Docker stack → e2e on every push. The deliberately simplified parts are listed honestly at the end ([Deliberately not done](#deliberately-not-done)).
 
 The whole stack runs via Docker: `make up` — no Python required on the host.
 
@@ -13,6 +29,22 @@ The whole stack runs via Docker: `make up` — no Python required on the host.
 - **rabbitmq** — `payments` exchange + TTL retry topology + DLQ; management UI on `:15672`.
 - Guarantees: creation is atomic with the event (single TX), delivery is at-least-once, re-processing is idempotent, messages that exhaust their retries end up in `payments.dlq` with an `x-death` history.
 - Code layout: one package per domain (`payments`, `processing`, `outbox`, `messaging`); all SQL lives in thin repositories (`PaymentRepository`, `OutboxRepository`) that accept an injected session, while services own transaction boundaries.
+
+## The outbox pattern, end to end
+
+What makes this a reference implementation rather than a sketch: every property of the pattern is implemented once, in one place, and pinned by a test that breaks if it regresses.
+
+| Pattern requirement | Implementation | Pinned by |
+|---|---|---|
+| Event written atomically with the business row | `payments` + `outbox` inserted in a single transaction | `tests/integration/test_payments_idempotency.py` |
+| At-least-once dispatch | publisher confirms; a row is marked only after a confirmed publish, failed rows are retried on the next cycle | `test_publish_then_crash_republishes_same_message_id` |
+| Duplicate dispatch is harmless | idempotent consumer: terminal-status gate + atomic lease claim | `test_concurrent_handle_runs_gateway_exactly_once` |
+| Multiple relay instances | row-wise `FOR UPDATE SKIP LOCKED` dispatch | `test_concurrent_run_once_each_row_exactly_once` |
+| Consumer crash mid-flight | processing lease expires (`GATEWAY_LEASE_TTL_S`), redelivery re-claims the payment | `test_crash_after_claim_is_reclaimed_by_redelivery` |
+| No lock held across external calls | claim / finalize / delivery-mark are short transactions; the gateway and webhook calls run with no open session | `test_no_row_lock_held_during_gateway` |
+| Poison messages quarantined | 3 TTL retries → DLQ with `x-death` history | `test_persistent_gateway_timeout_reaches_dlq_and_keeps_pending` |
+| Storage stays bounded | retention deletes dispatched outbox rows in batches | `test_cleanup_expired_*` |
+| Observable status during processing | public status stays `pending`; the lease column is internal | `test_get_status_returns_pending_while_gateway_in_flight` |
 
 ## Architecture
 
